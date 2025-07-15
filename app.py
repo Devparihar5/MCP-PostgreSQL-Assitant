@@ -148,6 +148,11 @@ def analyze_database_schema():
                 schema_details[f"{table_name}_relationships"] = relationships
             except:
                 pass
+            try:
+                rel_result = st.session_state.mcp_client.handler.get_all_relationships()
+                st.session_state.relationship_cache = rel_result
+            except:
+                st.session_state.relationship_cache = []
         return True, schema_details
     except Exception as e:
         return False, f"Schema analysis failed: {str(e)}"
@@ -359,6 +364,10 @@ if st.session_state.page == "main":
             with st.spinner("Thinking..."):
                 answer = handle_general_question(user_question)
 
+            if "last_sql" in st.session_state:
+                st.subheader("Generated SQL")
+                st.code(st.session_state.last_sql, language="sql")
+
             st.session_state.chat_history.append({
                 "type": "user",
                 "content": user_question,
@@ -397,14 +406,24 @@ with st.expander("Run raw MCP tools"):
     params = {}
     if tool in ["describe_table", "find_relationships"]:
         if st.session_state.tables:
-            params["table_name"] = st.selectbox("Table Name", st.session_state.tables)
+            params["table_names"] = st.multiselect("Select Tables", st.session_state.tables)
         else:
             params["table_name"] = st.text_input("Table Name")
     elif tool == "query":
         params["sql"] = st.text_area("SQL Query")
 
     if st.button("Run MCP Tool"):
-        result, exec_time = execute_mcp_tool(tool, **params)
+        if tool == "find_relationships":
+            all_relationships = []
+            selected_tables = params.get("table_names", [])
+            for table in selected_tables:
+                res, _ = execute_mcp_tool("find_relationships", table_name=table)
+                all_relationships.extend(json.loads(res))
+            result = json.dumps(all_relationships)
+            exec_time = 0.01  # dummy exec time for now
+        else:
+            result, exec_time = execute_mcp_tool(tool, **params)
+
         st.write(f"Time: {exec_time:.2f}s")
         
         try:

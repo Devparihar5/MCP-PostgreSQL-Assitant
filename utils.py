@@ -2,7 +2,8 @@ import json
 import streamlit as st
 import re
 import logging
-
+from collections import deque, defaultdict
+import pandas as pd
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +41,9 @@ def execute_mcp_tool(tool, **params):
             logger.info(f"find_relationships for {table_name} result: {result[:200]}...")
         elif tool == "query":
             sql = params.get("sql", "")
+            st.subheader("Generated SQL")
+            st.code(sql, language="sql")
+            st.session_state["last_sql"] = sql
             logger.info(f"Executing SQL query: {sql}")
             result, _ = client.query(sql)
             logger.info(f"Query result: {result[:200]}...")
@@ -79,6 +83,26 @@ def extract_table_names_from_question(question, available_tables):
 
     return mentioned_tables
 
+def is_follow_up_question(user_question: str) -> bool:
+    """
+    Return True when the question looks like a continuation
+    of the immediately‑preceding query rather than a fresh topic.
+    """
+    follow_up_starts = [
+        "what about",
+        "and",
+        "now",
+        "then",
+        "show that",
+        "continue",
+        "compare",
+        "filter",
+        "add ",
+        "by ",
+    ]
+    uq = user_question.lower().strip()
+    return any(uq.startswith(s) for s in follow_up_starts)
+
 
 def validate_tables_and_get_relationships(tables, mcp_client):
     """
@@ -115,36 +139,87 @@ def validate_tables_and_get_relationships(tables, mcp_client):
         table_schemas[table] = json.loads(result)
 
     # Get relationships between tables
+    all_relationships = mcp_client.handler.get_all_relationships()  
+    graph = build_relationship_graph(all_relationships)
     for i in range(len(existing_tables)):
-        for j in range(i+1, len(existing_tables)):
-            table1 = existing_tables[i]
-            table2 = existing_tables[j]
+        for j in range(i + 1, len(existing_tables)):
+            path = find_join_path(graph, existing_tables[i], existing_tables[j])
+            if path:
+                for rel in path:
+                    relationships.append({
+                        "source_table": rel[0],
+                        "target_table": rel[1],
+                        "source_column": rel[2],
+                        "target_column": rel[3]
+                    })
 
             # Check relationships from table1 to table2
-            result, _ = mcp_client.find_relationships(table1)
-            relations = json.loads(result)
-            for relation in relations:
-                if relation.get("foreign_table") == table2:
-                    relationships.append({
-                        "source_table": table1,
-                        "source_column": relation.get("column_name"),
-                        "target_table": table2,
-                        "target_column": relation.get("foreign_column")
-                    })
+            # result, _ = mcp_client.find_relationships(table1)
+            # relations = json.loads(result)
+            # for relation in relations:
+            #     if relation.get("foreign_table") == table2:
+            #         relationships.append({
+            #             "source_table": table1,
+            #             "source_column": relation.get("column_name"),
+            #             "target_table": table2,
+            #             "target_column": relation.get("foreign_column")
+            #         })
 
-            # Check relationships from table2 to table1
-            result, _ = mcp_client.find_relationships(table2)
-            relations = json.loads(result)
-            for relation in relations:
-                if relation.get("foreign_table") == table1:
-                    relationships.append({
-                        "source_table": table2,
-                        "source_column": relation.get("column_name"),
-                        "target_table": table1,
-                        "target_column": relation.get("foreign_column")
-                    })
+            # # Check relationships from table2 to table1
+            # result, _ = mcp_client.find_relationships(table2)
+            # relations = json.loads(result)
+            # for relation in relations:
+            #     if relation.get("foreign_table") == table1:
+            #         relationships.append({
+            #             "source_table": table2,
+            #             "source_column": relation.get("column_name"),
+            #             "target_table": table1,
+            #             "target_column": relation.get("foreign_column")
+            #         })
 
     return existing_tables, missing_tables, relationships, table_schemas
+
+def build_relationship_graph(relationships):
+    """
+    Build a graph where each node is a table, and edges are foreign key relationships.
+    The graph is bidirectional so that join paths can be found in either direction.
+    """
+    graph = defaultdict(list)
+    
+    for rel in relationships:
+        graph[rel['source_table']].append({
+            "to": rel['target_table'],
+            "from_column": rel['source_column'],
+            "to_column": rel['target_column']
+        })
+        
+        graph[rel['target_table']].append({
+            "to": rel['source_table'],
+            "from_column": rel['target_column'],
+            "to_column": rel['source_column']
+        })
+        
+    return graph
+
+def find_join_path(graph, start_table, end_table):
+    visited = set()
+    queue = deque([(start_table, [])])
+
+    while queue:
+        current, path = queue.popleft()
+        if current == end_table:
+            return path
+
+        if current in visited:
+            continue
+        visited.add(current)
+
+        for neighbor in graph[current]:
+            next_table = neighbor["to"]
+            if next_table not in visited:
+                queue.append((next_table, path + [(current, next_table, neighbor["from_column"], neighbor["to_column"])]))
+
+    return None
 
 
 def get_all_table_schemas(mcp_client):
@@ -461,6 +536,40 @@ def validate_sql_query(sql, table_schemas):
 
 
 def handle_general_question(user_question):
+    context_prefix = ""
+    history = st.session_state.get("chat_history", [])
+    if len(history) < 2:
+        context_prefix = user_question
+
+# NEW – decide if the question is a follow‑up
+    if is_follow_up_question(user_question) and len(history) >= 2:
+        prev_user_msg = history[-2]["content"]
+        prev_ai_msg   = history[-1]["content"]
+        last_sql = st.session_state.get("last_sql", "")
+
+        context_prefix = f"""
+        You are continuing a conversation with the user.
+
+        🛑 VERY IMPORTANT:
+        Continue using the same structure, tables, columns, joins, and logic from the previous query.
+        Only change if the user clearly asks to.
+
+        ⚙️ Use this context:
+
+        Previous Question:
+        {prev_user_msg}
+
+        Previous Answer:
+        {prev_ai_msg}
+
+        Previous SQL:
+        {last_sql}
+
+        User's New Question:
+        {user_question}
+        """
+    else:
+        context_prefix = user_question
     """MCP-compliant: LLM plans tool call → MCP runs it → LLM interprets result."""
     selected_llm = st.session_state.get("selected_llm", "groq")
 
@@ -476,6 +585,23 @@ def handle_general_question(user_question):
 
     mcp_client = st.session_state.get("mcp_client")
     schema_cache = st.session_state.get("schema_cache", {})
+    
+    if not schema_cache:
+        logger.info("Schema cache is empty — analyzing schema.")
+        from app import analyze_database_schema
+        schema_success, schema_details = analyze_database_schema()
+        if not schema_success:
+            return "Could not analyze database schema. Please refresh the schema or reconnect to the database."
+    schema_cache = st.session_state.get("schema_cache", {})
+
+    if "relationship_cache" not in st.session_state:
+        try:
+            rel_result = mcp_client.handler.get_all_relationships()
+            st.session_state.relationship_cache = rel_result
+            logger.info("Loaded relationship cache.")
+        except Exception as e:
+            logger.warning(f"Failed to load relationships: {e}")
+            st.session_state.relationship_cache = []
 
     if not llm_client or not mcp_client:
         return f"{selected_llm.upper()} client or MCP client is not initialized."
@@ -514,11 +640,17 @@ def handle_general_question(user_question):
             for col in schema:
                 enhanced_schema_context += f"  - {col.get('column_name')} ({col.get('data_type')})\n"
 
-        if relationships:
-            enhanced_schema_context += "\nRelationships between tables:\n"
-            for rel in relationships:
-                enhanced_schema_context += f"  - {rel['source_table']}.{rel['source_column']} → {rel['target_table']}.{rel['target_column']}\n"
+        # if relationships:
+        #     enhanced_schema_context += "\nRelationships between tables:\n"
+        #     for rel in relationships:
+        #         enhanced_schema_context += f"  - {rel['source_table']}.{rel['source_column']} → {rel['target_table']}.{rel['target_column']}\n"
 
+        schema_summary = enhanced_schema_context if enhanced_schema_context else ""
+
+        if relationships:
+            schema_summary += "\nJoin Paths:\n"
+            for rel in relationships:
+                schema_summary += f"- {rel['source_table']}.{rel['source_column']} → {rel['target_table']}.{rel['target_column']}\n"
     # Add date/time columns information
     datetime_context = "\nDate/Time columns (for time-based analysis):\n"
     for table, columns in datetime_columns.items():
@@ -574,6 +706,9 @@ When generating SQL queries:
 12. CRITICAL: Always include all referenced tables in the FROM clause or JOIN statements
 
 Only return the JSON. Do NOT explain or say anything else.
+ALSO: DO NOT split strings using '+' or line breaks. 
+ALWAYS return a SINGLE raw JSON object with the SQL query as one full string value inside "sql". 
+The JSON should be valid, self-contained, and parseable with json.loads().
 
 Schema:
 {schema_summary}
@@ -586,9 +721,37 @@ User Question:
         if selected_llm in ["groq", "openai"]:
             logger.info(
                 f"Sending prompt to {selected_llm} model {model_name}:\n{planning_prompt[:500]}...")
+            
+            history = st.session_state.get("chat_history", [])
+
+            if len(history) >= 2:
+                prev_user_msg = history[-2]["content"]
+                prev_ai_msg   = history[-1]["content"]
+                context_prefix = f"""
+            You are continuing a conversation with the user.
+
+            For every new question, you MUST:
+            - Rebuild the SQL query from scratch based on the schema
+            - Include ALL required joins and filters
+            - Match the level of detail from the previous query
+            - Do NOT simplify to a single COUNT unless the previous query was also a single COUNT
+
+            Use the following as context only:
+
+            Previous Question:
+            {prev_user_msg}
+
+            Previous Answer:
+            {prev_ai_msg}
+
+            New Question:
+            {user_question}
+            """
+            else:
+                context_prefix = user_question
 
             response = llm_client.chat.completions.create(
-                messages=[{"role": "user", "content": planning_prompt}],
+                messages=[{"role": "user", "content": context_prefix + "\n\n" + planning_prompt}],
                 model=model_name,
                 temperature=0,
                 max_tokens=2000,  # Increased max_tokens to avoid truncation
@@ -620,7 +783,7 @@ User Question:
             logger.info(
                 f"Sending prompt to {selected_llm} model {model_name}:\n{planning_prompt[:500]}...")
 
-            response = llm_client.generate_content(planning_prompt)
+            response = llm_client.generate_content(context_prefix + "\n\n" + planning_prompt)
             tool_plan_raw = response.text.strip()
 
             logger.info(
@@ -874,6 +1037,7 @@ Please rewrite the query using one of these date/time columns. Only return the c
                     try:
                         logger.info(f"Executing retry SQL query: {retry_sql}")
                         result, _ = mcp_client.query(retry_sql)
+                        st.session_state["last_sql"] = retry_sql
                         logger.info(f"Retry SQL query executed successfully")
                         # If successful, update the SQL for the interpretation step
                         sql = retry_sql
@@ -889,7 +1053,12 @@ Please rewrite the query using one of these date/time columns. Only return the c
 
                 logger.info(f"Executing validated SQL query: {sql}")
                 result, _ = mcp_client.query(sql)
-                logger.info(f"SQL query executed successfully")
+                st.session_state["last_sql"] = sql
+                if isinstance(result, list) and len(result) > 0:
+                    df = pd.DataFrame(result)
+                    st.subheader("Result Preview")
+                    st.dataframe(df)
+                    logger.info(f"SQL query executed successfully")
         else:
             logger.error(f"Unsupported tool: {tool}")
             return f" Unsupported tool: {tool}"
@@ -922,6 +1091,8 @@ Result:
         logger.info(f"Sending interpretation prompt to {selected_llm} model {model_name}")
         
         if selected_llm in ["groq", "openai"]:
+            if tool == "query" and isinstance(result, list) and len(result) == 0:
+                return "There were no results found for your query."
             response = llm_client.chat.completions.create(
                 messages=[{"role": "user", "content": interpretation_prompt}],
                 model=model_name,

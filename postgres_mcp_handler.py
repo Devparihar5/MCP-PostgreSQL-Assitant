@@ -4,6 +4,7 @@ from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
 import logging
 import decimal
+import datetime
 
 logger = logging.getLogger("postgres-mcp-handler")
 
@@ -42,13 +43,37 @@ class PostgresMCPHandler:
                     for row in rows:
                             clean_row = {}
                             for key, value in row.items():
-                                clean_row[key] = float(value) if isinstance(value, decimal.Decimal) else value
+                                if isinstance(value, decimal.Decimal):
+                                    clean_row[key] = float(value)
+                                elif isinstance(value, (datetime.datetime, datetime.date)):
+                                    clean_row[key] = value.isoformat()
+                                else:
+                                    clean_row[key] = value
                             safe_rows.append(clean_row)
                     return safe_rows
                 conn.commit()
                 return [{"affected_rows": cur.rowcount}]
         finally:
             self._release_connection(conn)
+
+    def get_all_relationships(self, db_schema: str = "public") -> List[dict]:
+        sql = """
+        SELECT 
+            tc.table_name AS source_table,
+            kcu.column_name AS source_column,
+            ccu.table_name AS target_table,
+            ccu.column_name AS target_column
+        FROM 
+            information_schema.table_constraints AS tc
+        JOIN information_schema.key_column_usage AS kcu
+            ON tc.constraint_name = kcu.constraint_name
+        JOIN information_schema.constraint_column_usage AS ccu
+            ON ccu.constraint_name = tc.constraint_name
+        WHERE 
+            tc.constraint_type = 'FOREIGN KEY'
+            AND tc.table_schema = %s;
+        """
+        return self._execute(sql, [db_schema])        
 
     def health_check(self) -> List[dict]:
         return self._execute("SELECT 1 as healthy")
