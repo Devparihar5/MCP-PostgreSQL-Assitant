@@ -4,8 +4,48 @@ from datetime import datetime
 from groq import Groq
 from openai import OpenAI
 import google.generativeai as genai
-from utils import execute_mcp_tool, handle_general_question
+from utils import execute_mcp_tool, handle_general_question, generate_prompt
 from postgres_mcp_handler import PostgresMCPHandler
+
+table_groups = {
+    "Orders & Fulfillment": [
+        "orders", "order_items", "order_cost", "order_status",
+        "order_status_history", "order_tools", "order_workhrs",
+        "payment_types", "price_types"
+    ],
+    "Manufacturing": [
+        "manufacturing_phases", "materials", "products", "product_items",
+        "product_categories", "product_tools", "tools"
+    ],
+    "Leads & CRM": [
+        "leads", "lead_status", "lead_status_history", "lead_proposals",
+        "lead_items", "lead_products", "lead_tools"
+    ],
+    "Employees & Attendance": [
+        "employees", "employees_attendance"
+    ],
+    "Locations & Weather": [
+        "locations", "locations_weather"
+    ],
+    "Customers & Franchises": [
+        "customers", "customer_types", "companies", "franchises"
+    ],
+    "KPI & Dashboards": [
+        "insights_history", "insight_reads", "insights_history_data",
+        "insight_configs", "insight_kpi_configs", "custom_charts",
+        "chart_configs", "suggestive_insights"
+    ],
+    "Quotations & Projects": [
+        "quotations_cost", "quotations_workhrs", "project_types"
+    ],
+    "Sales & Targets": [
+        "sales_configs", "sales_config_values", "target_configs",
+        "target_config_values", "target_type_mapping"
+    ],
+    "RAG & Training": [
+        "rag_assets", "rag_training"
+    ]
+}
 
 class MCPClient:
     def __init__(self, db_config: dict):
@@ -325,6 +365,7 @@ with st.sidebar:
                     analyze_database_schema()
                     st.success("Schema refreshed")
                     st.rerun()
+                    
         if st.button("Clear Chat"):
             st.session_state.chat_history = []
             st.rerun()
@@ -353,16 +394,52 @@ if st.session_state.page == "main":
 
     user_question = st.selectbox(
         "Pick an AI-generated question or type your own:",
-        st.session_state.ai_generated_questions + ["Type your own"]
+        st.session_state.get("ai_generated_questions", []) + ["Type your own"]
     )
 
+    
     if user_question == "Type your own":
         user_question = st.text_input("Enter your question here")
+        selected_group = st.selectbox(
+            "📊 Choose a table group:",
+            list(table_groups.keys()),
+            key="table_group_select"
+        )
+        selected_tables = table_groups[selected_group]
+    else:
+        selected_tables = table_groups["Orders & Fulfillment"]
+
+
 
     if st.button("Ask"):
         if user_question:
             with st.spinner("Thinking..."):
-                answer = handle_general_question(user_question)
+                selected_group = st.selectbox(" Choose a table group:", list(table_groups.keys()))
+                selected_tables = table_groups[selected_group]
+
+                # === Filter schema and relationships ===
+                filtered_schema = {
+                    table: st.session_state.schema_cache[table]
+                    for table in selected_tables if table in st.session_state.schema_cache
+                }
+                filtered_relationships = [
+                    r for r in st.session_state.relationship_cache
+                    if isinstance(r, dict)
+                    and "from_table" in r and "to_table" in r
+                    and r["from_table"] in selected_tables
+                    and r["to_table"] in selected_tables
+                ]
+
+                # === Generate focused prompt ===
+                final_prompt = generate_prompt(
+                    question=user_question,
+                    filtered_schema=filtered_schema,
+                    filtered_relationships=filtered_relationships,
+                    previous_sql=st.session_state.get("last_sql")
+                )
+
+                # === Call the LLM handler (replace this with your actual LLM call) ===
+                answer = handle_general_question(final_prompt)
 
             if "last_sql" in st.session_state:
                 st.subheader("Generated SQL")

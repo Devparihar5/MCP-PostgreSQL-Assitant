@@ -153,29 +153,6 @@ def validate_tables_and_get_relationships(tables, mcp_client):
                         "target_column": rel[3]
                     })
 
-            # Check relationships from table1 to table2
-            # result, _ = mcp_client.find_relationships(table1)
-            # relations = json.loads(result)
-            # for relation in relations:
-            #     if relation.get("foreign_table") == table2:
-            #         relationships.append({
-            #             "source_table": table1,
-            #             "source_column": relation.get("column_name"),
-            #             "target_table": table2,
-            #             "target_column": relation.get("foreign_column")
-            #         })
-
-            # # Check relationships from table2 to table1
-            # result, _ = mcp_client.find_relationships(table2)
-            # relations = json.loads(result)
-            # for relation in relations:
-            #     if relation.get("foreign_table") == table1:
-            #         relationships.append({
-            #             "source_table": table2,
-            #             "source_column": relation.get("column_name"),
-            #             "target_table": table1,
-            #             "target_column": relation.get("foreign_column")
-            #         })
 
     return existing_tables, missing_tables, relationships, table_schemas
 
@@ -543,30 +520,31 @@ def handle_general_question(user_question):
 
 # NEW – decide if the question is a follow‑up
     if is_follow_up_question(user_question) and len(history) >= 2:
-        prev_user_msg = history[-2]["content"]
-        prev_ai_msg   = history[-1]["content"]
+    # Use last 5 turns (user-AI pairs) = 10 messages
+        recent_turns = history[-10:] if len(history) >= 10 else history
+
+        conversation_log = ""
+        for msg in recent_turns:
+            if msg["type"] == "user":
+                conversation_log += f"\nUser: {msg['content']}"
+            elif msg["type"] == "ai":
+                conversation_log += f"\nAI: {msg['content']}"
+
         last_sql = st.session_state.get("last_sql", "")
 
         context_prefix = f"""
-        You are continuing a conversation with the user.
+    You are continuing a multi-turn conversation with the user.
 
-        🛑 VERY IMPORTANT:
-        Continue using the same structure, tables, columns, joins, and logic from the previous query.
-        Only change if the user clearly asks to.
+    🛑 IMPORTANT: Maintain consistency in tables, columns, and SQL logic across turns.
 
-        ⚙️ Use this context:
+    💬 Previous Conversation:
+    {conversation_log}
 
-        Previous Question:
-        {prev_user_msg}
+    📌 Last SQL used:
+    {last_sql}
 
-        Previous Answer:
-        {prev_ai_msg}
-
-        Previous SQL:
-        {last_sql}
-
-        User's New Question:
-        {user_question}
+    User's New Question:
+    {user_question}
         """
     else:
         context_prefix = user_question
@@ -581,7 +559,7 @@ def handle_general_question(user_question):
         model_name = "gpt-4o"
     else:  # Gemini
         llm_client = st.session_state.get("gemini_client")
-        model_name = "gemini-2.0-flash"  # Updated to use the latest model
+        model_name = "gemini-2.5-flash"  # Updated to use the latest model
 
     mcp_client = st.session_state.get("mcp_client")
     schema_cache = st.session_state.get("schema_cache", {})
@@ -1118,3 +1096,43 @@ Result:
     except Exception as e:
         logger.error(f"Failed to interpret tool result: {str(e)}", exc_info=True)
         return f" Failed to interpret tool result: {e}"
+    
+
+def generate_prompt(question, filtered_schema, filtered_relationships, previous_sql=None):
+    schema_str = ""
+    for table, cols in filtered_schema.items():
+        schema_str += f"Table: {table}\n"
+        for col in cols:
+            fk = ""
+            if col.get("foreign_key"):
+                fk = f", FK to {col['foreign_key']}"
+            if "name" in col and "type" in col:
+                fk = f", FK to {col['foreign_key']}" if col.get("foreign_key") else ""
+                schema_str += f"- {col['name']} ({col['type']}{fk})\n"
+            else:
+                logger.warning(f"Skipping malformed column entry: {col}")
+        schema_str += "\n"
+
+    rel_str = "\n".join([
+        f"{r['from_table']}.{r['from_column']} → {r['to_table']}.{r['to_column']}"
+        for r in filtered_relationships
+    ])
+
+    prompt = f"""
+You are an expert SQL assistant for PostgreSQL. Use the following database schema to answer the user's question.
+
+### SCHEMA
+{schema_str}
+
+### RELATIONSHIPS
+{rel_str or 'None'}
+
+### QUESTION
+{question}
+"""
+
+    if previous_sql:
+        prompt += f"\n### PREVIOUS SQL\n{previous_sql}"
+
+    return prompt.strip()
+
